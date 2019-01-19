@@ -4,9 +4,10 @@ from tempfile import TemporaryDirectory
 from itertools import count
 
 import petname
+import numpy as np
 import tensorflow as tf
 
-# TODO - Implement eval_metric_ops plots
+# TODO - Progress printing on training
 
 # <editor-fold desc="Data types">
 ModelFn = Callable[[Dict[str, tf.Tensor], tf.Tensor, Optional[dict]], Tuple[
@@ -56,6 +57,15 @@ class ValidationSpec:
         # Visualize
         tf.summary.scalar('loss', self.loss)
 
+    def get_running_variables(self):
+        running_vars = list()
+
+        for metric_tensor, _ in self.metric_ops.values():
+            running_vars.extend(
+                tf.get_collection(tf.GraphKeys.LOCAL_VARIABLES, scope=_get_scope(tensor_name=metric_tensor.name)))
+
+        return running_vars
+
 
 class PredictSpec:
 
@@ -67,6 +77,21 @@ class PredictSpec:
         """
 
         self.output = output
+
+
+def _get_scope(tensor_name: str) -> str:
+    """
+    Gets the scope of a tensor. None of tensor has no scope
+
+    :param tensor_name: Full tensor name
+    :return: Isolated scope name (without /)
+    """
+
+    split_name = tensor_name.split('/')
+    if len(split_name) < 2:
+        return None
+
+    return split_name[-2]
 
 
 class Estimator:
@@ -114,12 +139,15 @@ class Estimator:
         # To be defined with the setup_training method
         self._handle = None
         self._train_handle = None
+        self._train_iterator = None
         self._validation_handle = None
+        self._validation_iterator = None
         self._train_spec = None
         self._validation_spec = None
         self._predict_spec = None
         self._is_training = None
         self._visualization_op = None
+        self._running_variables_initializer = None
 
     def _get_or_create_directory(self,
                                  model_dir: Union[str, None]) -> Path:
@@ -142,39 +170,51 @@ class Estimator:
 
         return model_dir
 
-    def setup_training(self,
-                       train_input_fn: InputFn,
-                       validation_input_fn: Optional[InputFn] = None,
-                       data_keys: Optional[List[str]] = None) -> 'Estimator':
+    def setup(self,
+              train_input_fn: Optional[InputFn] = None,
+              validation_input_fn: Optional[InputFn] = None,
+              data_keys: Optional[List[str]] = None) -> 'Estimator':
 
         validation_iterator = None
+        train_iterator = None
+
+        if not train_input_fn and not validation_input_fn:
+            return self
 
         # If data_keys not provided, use 0, 1, 2 ...
         data_keys = data_keys if data_keys else count()
 
         with self._graph.as_default():
             with tf.variable_scope('input'):
-                # Setup training data pipeline
-                train_dataset = train_input_fn()
-                train_iterator = train_dataset.make_initializable_iterator()
+                if train_input_fn:
+                    # Setup training data pipeline
+                    train_dataset = train_input_fn()
+                    train_iterator = train_dataset.make_initializable_iterator()
 
                 self._is_training = tf.placeholder_with_default(False, shape=[], name='is_training')
 
                 if validation_input_fn:
                     # Setup validation data pipeline
                     validation_dataset = validation_input_fn()
-                    validation_iterator = validation_dataset.make_one_shot_iterator()
+                    validation_iterator = validation_dataset.make_initializable_iterator()
 
                 # Iterators handling
+                output_types = train_dataset.output_types if train_input_fn else validation_dataset.output_types
+                output_shapes = train_dataset.output_shapes if train_input_fn else validation_dataset.output_shapes
                 handle = tf.placeholder(tf.string, shape=[], name='iterator_handle')
                 iterator = tf.data.Iterator.from_string_handle(handle,
-                                                               output_types=train_dataset.output_types,
-                                                               output_shapes=train_dataset.output_shapes)
+                                                               output_types=output_types,
+                                                               output_shapes=output_shapes)
 
                 data = {data_key: tf.identity(data_tensor, name=data_key)
                         for data_key, data_tensor in zip(data_keys, iterator.get_next())}
 
             train_spec, validation_spec, predict_spec = self._model_fn(data, self._is_training, self._params)
+
+            # Prepare running variables initializer for metric's running variables
+            if validation_spec:
+                self._running_variables_initializer = tf.variables_initializer(
+                    var_list=validation_spec.get_running_variables())
 
             self._visualization_op = tf.summary.merge_all()
             self.train_logs.mkdir()
@@ -182,9 +222,11 @@ class Estimator:
                 self.validation_logs.mkdir()
 
         # Assign
-        self._train_handle = train_iterator.string_handle('train_handle')
+        self._train_handle = train_iterator.string_handle('train_handle') if train_iterator else None
+        self._train_iterator = train_iterator
         self._validation_handle = validation_iterator.string_handle(
             'validation_handle') if validation_iterator else None
+        self._validation_iterator = validation_iterator
         self._handle = handle
         self._train_spec = train_spec
         self._validation_spec = validation_spec
@@ -227,7 +269,11 @@ class Estimator:
                         self._visualization_op]  # TB visualization op
         local_step = 0
 
-        # Visualizing and persisting
+        # First time initialization
+        if not self._session.run(global_step):
+            self._session.run(self._train_iterator.initializer)
+
+        # Visualizing
         train_writer = tf.summary.FileWriter(logdir=str(self.train_logs),
                                              graph=self._graph)
 
@@ -239,7 +285,6 @@ class Estimator:
                 _, global_step_, loss, visualization = self._session.run(fetches=session_vars,
                                                                          feed_dict={self._handle: self._train_handle,
                                                                                     self._is_training: True})
-
                 # Visualizing
                 train_writer.add_summary(visualization, global_step=global_step_)
 
@@ -247,6 +292,70 @@ class Estimator:
                     raise StopIteration
 
             except (tf.errors.OutOfRangeError, StopIteration):
-                pass
+
+                # Initializer train iterator when needed
+                if max_steps == float('inf') or local_step == max_steps:
+                    self._session.run(self._train_iterator.initializer)
 
         return self
+
+    def validate(self) -> dict:
+        """
+        Validate
+
+        :return: Loss and validation metrics as defined in the ValidationSpec
+        """
+
+        if not self._validation_spec or not self._validation_handle:
+            raise RuntimeError('Must call setup before using the validate method')
+
+        # Init
+        global_step = tf.train.get_global_step(graph=self._graph)
+        metric_update_ops = [v[1] for v in self._validation_spec.eval_metrics_ops.values()]  # Gather update ops
+        losses = []  # Gather losses per batch
+        self._session.run([self._validation_iterator.initializer,
+                           self._running_variables_initializer])
+
+        session_vars = [self._validation_spec.loss,  # Loss
+                        self._visualization_op,  # TB visualization op
+                        ] + metric_update_ops
+
+        # Visualizing
+        validation_writer = tf.summary.FileWriter(logdir=str(self.validation_logs))
+
+        # Evaluation
+        while True:
+            try:
+                # Evaluation step
+                batch_results = self._session.run(fetches=session_vars,
+                                                  feed_dict={self._handle: self._validation_handle,
+                                                             self._is_training: False})
+
+                # Unpack
+                batch_losses = batch_results[0]
+
+                # Gather losses
+                losses.extend(batch_losses)
+
+            except tf.errors.OutOfRangeError:
+
+                # Calculate total loss
+                validation_loss = np.array(losses).mean()
+
+                # Gather metrics
+                metric_names = list(self._validation_spec.eval_metrics_ops.keys())
+                metric_tensors = [v[0] for v in self._validation_spec.eval_metrics_ops.values()]
+                metric_values = self._session.run(fetches=metric_tensors + [global_step])
+                global_step_ = metric_values[-1]
+                metrics = dict(zip(metric_names, metric_values[:-1]))
+
+                # Add loss
+                metrics['loss'] = validation_loss
+
+                # Visualize
+                for tag, value in metrics.items():
+                    summary = tf.Summary()
+                    summary.value.add(tag=tag, simple_value=value)
+                    validation_writer.add_summary(summary, global_step=global_step_)
+
+                return metrics
