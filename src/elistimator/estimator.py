@@ -1,7 +1,9 @@
-from typing import Callable, Optional, Tuple, Union, Dict, List
+from typing import Callable, Optional, Tuple, Union, Dict, List, Any
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from itertools import count
+from collections import defaultdict
+from contextlib import suppress
 
 import petname
 import numpy as np
@@ -148,6 +150,7 @@ class Estimator:
         self._is_training = None
         self._visualization_op = None
         self._running_variables_initializer = None
+        self._input_signature = None
 
     def _get_or_create_directory(self,
                                  model_dir: Union[str, None]) -> Path:
@@ -231,6 +234,7 @@ class Estimator:
         self._train_spec = train_spec
         self._validation_spec = validation_spec
         self._predict_spec = predict_spec
+        self._input_signature = {data_key: data_tensor.name for data_key, data_tensor in data.items()}
 
         return self
 
@@ -359,3 +363,70 @@ class Estimator:
                     validation_writer.add_summary(summary, global_step=global_step_)
 
                 return metrics
+
+    def predict(self, *args, input_fn: Optional[InputFn] = None, **kwargs) -> dict:
+        """
+        Predict. Supply args / kwargs / input function (only one).
+
+        :param args:
+        :param input_fn:
+        :param kwargs:
+        :return:
+        """
+
+        if sum([bool(args), bool(input_fn), bool(kwargs)]) != 1:
+            raise ValueError('Must supply ONE AND ONLY ONE of positional args / key-word args / input function')
+
+        # Predict from dataset
+        if input_fn:
+            return self._predict_from_dataset(input_fn=input_fn)
+
+        # Predict using feed dict
+        feed_dict = dict()
+        input_keys = list(self._input_signature.keys())
+        input_tensors = list(self._input_signature.values())
+        if args:
+            feed_dict = {self._input_signature[index]: value for index, value in enumerate(args)}
+        elif kwargs:
+            try:
+                for key, value in kwargs.items():
+                    feed_dict[self._input_signature[key]] = value
+            except KeyError:
+                raise KeyError(
+                    '{} not found in input signature. ({})'.format(key, ', '.join(self._input_signature.keys())))
+
+        # Run on graph
+        results = self._session.run(fetches=input_tensors, feed_dict=feed_dict)
+
+        predictions = dict(zip(input_keys, results))
+
+        return predictions
+
+    def _predict_from_dataset(self, input_fn: InputFn) -> dict:
+        """
+        Predict from dataset
+
+        :param input_fn: Input function
+        :return: Predictions
+        """
+
+        # Init
+        dataset = input_fn()
+        iterator = dataset.make_initializable_iterator()
+        handle = iterator.string_handle()
+        prediction_keys = list(self._predict_spec.output.keys())
+        prediction_values = list(self._predict_spec.output.values())
+        session_vars = prediction_values
+        predictions = defaultdict(list)
+
+        with suppress(tf.errors.OutOfRangeError):
+            while True:
+                # Evaluation step
+                batch_results = self._session.run(fetches=session_vars,
+                                                  feed_dict={self._handle: handle,
+                                                             self._is_training: False})
+
+                for key, value in zip(prediction_keys, batch_results):
+                    predictions[key].append(value)
+
+        return dict(predictions)
