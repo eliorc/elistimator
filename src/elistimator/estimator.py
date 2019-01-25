@@ -19,10 +19,6 @@ InputFn = Callable[[], tf.data.Dataset]
 # </editor-fold>
 
 
-class EstimatorSpec:
-    pass
-
-
 class TrainSpec:
 
     def __init__(self,
@@ -41,7 +37,7 @@ class TrainSpec:
         tf.summary.scalar('loss', self.loss)
 
 
-class ValidationSpec:
+class EvaluationSpec:
 
     def __init__(self,
                  loss: tf.Tensor,
@@ -96,6 +92,8 @@ def _get_scope(tensor_name: str) -> Optional[str]:
 
 
 class Estimator:
+
+    TQDM_NCOLS = 80
 
     @property
     def model_dir(self) -> Path:
@@ -241,9 +239,9 @@ class Estimator:
 
         # Create summary logs
         if validation_input_fn:
-            self.train_logs.mkdir()
+            self.train_logs.mkdir(parents=True)
         if validation_input_fn:
-            self.validation_logs.mkdir()
+            self.validation_logs.mkdir(parents=True)
 
         # Assign
         self._session = tf.Session(graph=self._graph)
@@ -303,7 +301,8 @@ class Estimator:
                         self._visualization_op]  # TB visualization op
         local_step = 0
         train_pbar = tqdm(total=self._train_size,
-                          desc='Training ({})'.format(self._train_count))
+                          desc='Training ({})'.format(self._train_count),
+                          ncols=self.TQDM_NCOLS)
 
         # First time initialization
         if not self._session.run(global_step):
@@ -356,12 +355,13 @@ class Estimator:
         # Init
         global_step = tf.train.get_global_step(graph=self._graph)
         local_step = 0
-        metric_update_ops = [v[1] for v in self._validation_spec.eval_metrics_ops.values()]  # Gather update ops
+        metric_update_ops = [v[1] for v in self._validation_spec.metric_ops.values()]  # Gather update ops
         losses = []  # Gather losses per batch
         self._session.run([self._validation_iterator.initializer,
                            self._running_variables_initializer])
         validation_pbar = tqdm(total=self._validation_size,
-                               desc='Validation')
+                               desc='Validation',
+                               ncols=self.TQDM_NCOLS)
 
         session_vars = [self._validation_spec.loss,  # Loss
                         self._visualization_op,  # TB visualization op
@@ -381,7 +381,7 @@ class Estimator:
                 batch_losses = batch_results[0]
 
                 # Gather losses
-                losses.extend(batch_losses)
+                losses.append(batch_losses)
 
                 # Update progress bar
                 validation_pbar.update()
@@ -392,8 +392,8 @@ class Estimator:
                 validation_loss = np.array(losses).mean()
 
                 # Gather metrics
-                metric_names = list(self._validation_spec.eval_metrics_ops.keys())
-                metric_tensors = [v[0] for v in self._validation_spec.eval_metrics_ops.values()]
+                metric_names = list(self._validation_spec.metric_ops.keys())
+                metric_tensors = [v[0] for v in self._validation_spec.metric_ops.values()]
                 metric_values = self._session.run(fetches=metric_tensors + [global_step])
                 global_step_ = metric_values[-1]
                 metrics = dict(zip(metric_names, metric_values[:-1]))
@@ -407,6 +407,8 @@ class Estimator:
 
                 # Close bar
                 validation_pbar.close()
+
+                self._validation_size = local_step
 
                 # Visualize
                 for tag, value in metrics.items():
