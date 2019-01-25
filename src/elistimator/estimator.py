@@ -18,6 +18,10 @@ InputFn = Callable[[], tf.data.Dataset]
 
 # </editor-fold>
 
+# TODO - Create evaluate() to be able to evaluate model on different datasets
+# TODO - Create save_ckpt() which will save checkpoints, also allow to alter saving options
+# TODO - Remove name of model if not necessary
+
 
 class TrainSpec:
 
@@ -50,9 +54,6 @@ class EvaluationSpec:
 
         self.loss = loss
         self.metric_ops = eval_metric_ops
-
-        # Visualize
-        tf.summary.scalar('loss', self.loss)
 
     def get_running_variables(self):
         running_vars = list()
@@ -92,7 +93,6 @@ def _get_scope(tensor_name: str) -> Optional[str]:
 
 
 class Estimator:
-
     TQDM_NCOLS = 80
 
     @property
@@ -311,8 +311,8 @@ class Estimator:
         # Training
         while local_step < max_steps:
             try:
+
                 # Training step
-                local_step += 1
                 _, global_step_, loss, visualization = self._session.run(fetches=session_vars,
                                                                          feed_dict={self._handle: self._train_handle,
                                                                                     self._is_training: True})
@@ -322,6 +322,8 @@ class Estimator:
                 # Update progress bar
                 train_pbar.set_postfix(loss=loss)
                 train_pbar.update()
+
+                local_step += 1
 
                 if local_step >= max_steps:
                     raise StopIteration
