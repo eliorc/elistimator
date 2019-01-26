@@ -1,26 +1,22 @@
-from typing import Callable, Optional, Tuple, Union, Dict, List, Any
+from typing import Callable, Optional, Tuple, Union, Dict, List, Generator
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from itertools import count
-from collections import defaultdict
 from contextlib import suppress
 
-import petname
 from tqdm import tqdm
 import numpy as np
 import tensorflow as tf
 
 # <editor-fold desc="Data types">
-ModelFn = Callable[[Dict[str, tf.Tensor], tf.Tensor, Optional[dict]], Tuple[
-    'TrainSpec', 'ValidationSpec', Optional['PredictSpec']]]
+ModelFn = Callable[[Dict[Union[str, int], tf.Tensor],  # Features
+                    tf.Tensor,  # Training mode (is_training)
+                    Optional[dict]],  # Parameters
+                   Tuple['TrainSpec', 'ValidationSpec', Optional['PredictSpec']]]
 InputFn = Callable[[], tf.data.Dataset]
 
 
 # </editor-fold>
-
-# TODO - Create evaluate() to be able to evaluate model on different datasets
-# TODO - Create save_ckpt() which will save checkpoints, also allow to alter saving options
-# TODO - Remove name of model if not necessary
 
 
 class TrainSpec:
@@ -60,9 +56,24 @@ class EvaluationSpec:
 
         for metric_tensor, _ in self.metric_ops.values():
             running_vars.extend(
-                tf.get_collection(tf.GraphKeys.LOCAL_VARIABLES, scope=_get_scope(tensor_name=metric_tensor.name)))
+                tf.get_collection(tf.GraphKeys.LOCAL_VARIABLES, scope=self._get_scope(tensor_name=metric_tensor.name)))
 
         return running_vars
+
+    @staticmethod
+    def _get_scope(tensor_name: str) -> Optional[str]:
+        """
+        Gets the scope of a tensor. None of tensor has no scope
+
+        :param tensor_name: Full tensor name
+        :return: Isolated scope name (without /)
+        """
+
+        split_name = tensor_name.split('/')
+        if len(split_name) < 2:
+            return None
+
+        return split_name[-2]
 
 
 class PredictSpec:
@@ -75,21 +86,6 @@ class PredictSpec:
         """
 
         self.output = output
-
-
-def _get_scope(tensor_name: str) -> Optional[str]:
-    """
-    Gets the scope of a tensor. None of tensor has no scope
-
-    :param tensor_name: Full tensor name
-    :return: Isolated scope name (without /)
-    """
-
-    split_name = tensor_name.split('/')
-    if len(split_name) < 2:
-        return None
-
-    return split_name[-2]
 
 
 class Estimator:
@@ -107,32 +103,37 @@ class Estimator:
     def validation_logs(self) -> Path:
         return self._model_dir / 'validation'
 
-    @train_logs.setter
-    def train_logs(self, value):
-        pass
+    @property
+    def train_checkpoints(self) -> Path:
+        return self._model_dir / 'checkpoints'
+
+    @property
+    def global_step(self) -> int:
+        return self._session.run(tf.train.get_global_step(graph=self._graph))
+
+    @property
+    def session(self) -> tf.Session:
+        return self._session
+
+    @property
+    def graph(self) -> tf.Graph:
+        return self._graph
 
     def __init__(self,
                  model_fn: ModelFn,
-                 name: Optional[str] = None,
                  model_dir: Optional[str] = None,
                  params: Optional[dict] = None):
         """
         Creates a new instance of the Estimator class
 
         :param model_fn: Model creating function
-        :param name: Name of the model
         :param model_dir: Directory to host all files related to the model
         :param params: Parameters to be available to the model_fn function
         """
 
         self._model_fn = model_fn
-        self._name = name if name is not None else petname.Generate()  # Generate random name
         self._model_dir = self._get_or_create_directory(model_dir)
         self._params = params if params is not None else {}
-
-        # TF references
-        self._graph = tf.Graph()
-        self._train_saver = None
 
         self._train_size = None
         self._validation_size = None
@@ -146,7 +147,7 @@ class Estimator:
         self._validation_handle = None
         self._validation_iterator = None
         self._train_spec = None
-        self._validation_spec = None
+        self._evaluation_spec = None
         self._predict_spec = None
         self._is_training = None
         self._visualization_op = None
@@ -154,55 +155,44 @@ class Estimator:
         self._input_signature = None
         self._train_summary_writer = None
         self._validation_summary_writer = None
+        self._train_saver = None
         self._session = None
-
-    def _get_or_create_directory(self,
-                                 model_dir: Union[str, None]) -> Path:
-        """
-        Gets if exists or creates a model directory. Will create a temporary one if model_dir == None
-
-        :param model_dir: Path to model directory
-        :return: Path to model directory
-        """
-
-        if isinstance(model_dir, str):
-            model_dir = Path(model_dir)
-            if not model_dir.parent.exists():
-                raise FileNotFoundError("Parent directory doesn't exist. ({})".format(model_dir.parent))
-            if not model_dir.exists():
-                model_dir.mkdir()
-        else:
-            model_dir = TemporaryDirectory()
-            model_dir = Path(model_dir.name)
-
-        return model_dir
+        self._graph = None
 
     def setup(self,
-              train_input_fn: Optional[InputFn] = None,
+              train_input_fn: InputFn,
               validation_input_fn: Optional[InputFn] = None,
-              data_keys: Optional[List[str]] = None) -> 'Estimator':
+              data_keys: Optional[List[str]] = None,
+              train_saver_options: Optional[dict] = None) -> 'Estimator':
+        """
+        Setup training flow, should be called only once.
+
+        :param train_input_fn: Training input function
+        :param validation_input_fn: Validation input function
+        :param data_keys: Keys to match output of the training/validation inputs
+        :param train_saver_options: Options to be passed to tf.train.Saver constructor
+        :return: self, for chaining
+        """
 
         # Init
         validation_iterator = None
-        train_iterator = None
         self._train_size = None
         self._validation_size = None
 
-        if not train_input_fn and not validation_input_fn:
-            return self
-
         # If data_keys not provided, use 0, 1, 2 ...
         data_keys = data_keys if data_keys else count()
+
+        self._graph = tf.Graph()
 
         with self._graph.as_default():
 
             tf.train.create_global_step()
 
             with tf.variable_scope('input'):
-                if train_input_fn:
-                    # Setup training data pipeline
-                    train_dataset = train_input_fn()
-                    train_iterator = train_dataset.make_initializable_iterator()
+
+                # Setup training data pipeline
+                train_dataset = train_input_fn()
+                train_iterator = train_dataset.make_initializable_iterator()
 
                 self._is_training = tf.placeholder_with_default(False, shape=[], name='is_training')
 
@@ -212,8 +202,8 @@ class Estimator:
                     validation_iterator = validation_dataset.make_initializable_iterator()
 
                 # Iterators handling
-                output_types = train_dataset.output_types if train_input_fn else validation_dataset.output_types
-                output_shapes = train_dataset.output_shapes if train_input_fn else validation_dataset.output_shapes
+                output_types = train_dataset.output_types
+                output_shapes = train_dataset.output_shapes
                 handle = tf.placeholder(tf.string, shape=[], name='iterator_handle')
                 iterator = tf.data.Iterator.from_string_handle(handle,
                                                                output_types=output_types,
@@ -235,13 +225,20 @@ class Estimator:
                 self._running_variables_initializer = tf.variables_initializer(
                     var_list=validation_spec.get_running_variables())
 
+            # Create visualization op
             self._visualization_op = tf.summary.merge_all()
 
-        # Create summary logs
+            # Create a train saver
+            self._train_saver = tf.train.Saver() if not train_saver_options else tf.train.Saver(**train_saver_options)
+
+        # Create summary logs directories
         if validation_input_fn:
             self.train_logs.mkdir(parents=True)
         if validation_input_fn:
             self.validation_logs.mkdir(parents=True)
+
+        # Create checkpoints diretory
+        self.train_checkpoints.mkdir(parents=True)
 
         # Assign
         self._session = tf.Session(graph=self._graph)
@@ -252,12 +249,12 @@ class Estimator:
         self._validation_iterator = validation_iterator
         self._handle = handle
         self._train_spec = train_spec
-        self._validation_spec = validation_spec
+        self._evaluation_spec = validation_spec
         self._predict_spec = predict_spec
         self._input_signature = {data_key: data_tensor.name for data_key, data_tensor in data.items()}
-        if train_input_fn:
-            self._train_summary_writer = tf.summary.FileWriter(logdir=str(self.train_logs),
-                                                               graph=self._graph)
+
+        self._train_summary_writer = tf.summary.FileWriter(logdir=str(self.train_logs),
+                                                           graph=self._graph)
         if validation_input_fn:
             self._validation_summary_writer = tf.summary.FileWriter(logdir=str(self.validation_logs),
                                                                     graph=self._graph)
@@ -272,13 +269,11 @@ class Estimator:
             self._session.run(tf.global_variables_initializer())
 
     def train(self,
-              max_steps: Optional[int] = None,
-              initialize_variables: Optional[bool] = False) -> 'Estimator':
+              max_steps: Optional[int] = None) -> 'Estimator':
         """
         Train. Runs for given number of steps or until iterator is exhausted
 
         :param max_steps: Steps to run for. (None = until iterator is exhausted)
-        :param initialize_variables: Call global_variables_initializer
         :return: self, for chaining
         """
 
@@ -286,10 +281,6 @@ class Estimator:
 
         if self._train_spec is None or self._train_handle is None:
             raise RuntimeError('Must call setup with train_input_fn before using the train method')
-
-        # Variable initializing
-        if initialize_variables:
-            self.initialize_global_variables()
 
         # Preparation
         if not max_steps:
@@ -351,13 +342,13 @@ class Estimator:
         :return: Loss and validation metrics as defined in the ValidationSpec
         """
 
-        if self._validation_spec is None or self._validation_handle is None:
+        if self._evaluation_spec is None or self._validation_handle is None:
             raise RuntimeError('Must call setup with validation_input_fn before using the train method')
 
         # Init
         global_step = tf.train.get_global_step(graph=self._graph)
         local_step = 0
-        metric_update_ops = [v[1] for v in self._validation_spec.metric_ops.values()]  # Gather update ops
+        metric_update_ops = [v[1] for v in self._evaluation_spec.metric_ops.values()]  # Gather update ops
         losses = []  # Gather losses per batch
         self._session.run([self._validation_iterator.initializer,
                            self._running_variables_initializer])
@@ -365,7 +356,7 @@ class Estimator:
                                desc='Validation',
                                ncols=self.TQDM_NCOLS)
 
-        session_vars = [self._validation_spec.loss,  # Loss
+        session_vars = [self._evaluation_spec.loss,  # Loss
                         self._visualization_op,  # TB visualization op
                         ] + metric_update_ops
 
@@ -394,8 +385,8 @@ class Estimator:
                 validation_loss = np.array(losses).mean()
 
                 # Gather metrics
-                metric_names = list(self._validation_spec.metric_ops.keys())
-                metric_tensors = [v[0] for v in self._validation_spec.metric_ops.values()]
+                metric_names = list(self._evaluation_spec.metric_ops.keys())
+                metric_tensors = [v[0] for v in self._evaluation_spec.metric_ops.values()]
                 metric_values = self._session.run(fetches=metric_tensors + [global_step])
                 global_step_ = metric_values[-1]
                 metrics = dict(zip(metric_names, metric_values[:-1]))
@@ -420,12 +411,16 @@ class Estimator:
 
                 return metrics
 
-    def predict(self, *args, input_fn: Optional[InputFn] = None, **kwargs) -> dict:
+    def predict(self, *args,
+                input_fn: Optional[InputFn] = None,
+                is_training: Optional[bool] = False,
+                **kwargs) -> Union[Generator[dict, None, None], dict]:
         """
         Predict. Supply args / kwargs / input function (only one).
 
         :param args:
         :param input_fn:
+        :param is_training:
         :param kwargs:
         :return:
         """
@@ -435,54 +430,152 @@ class Estimator:
 
         # Predict from dataset
         if input_fn:
-            return self._predict_from_dataset(input_fn=input_fn)
+            return self._predict_from_dataset(input_fn=input_fn, is_training=is_training)
 
         # Predict using feed dict
         feed_dict = dict()
-        input_keys = list(self._input_signature.keys())
-        input_tensors = list(self._input_signature.values())
         if args:
             feed_dict = {self._input_signature[index]: value for index, value in enumerate(args)}
         elif kwargs:
-            try:
-                for key, value in kwargs.items():
+            for key, value in kwargs.items():
+                try:
                     feed_dict[self._input_signature[key]] = value
-            except KeyError:
-                raise KeyError(
-                    '{} not found in input signature. ({})'.format(key, ', '.join(self._input_signature.keys())))
+                except KeyError:
+                    raise KeyError(
+                        '{} not found in input signature. ({})'.format(key, ', '.join(self._input_signature.keys())))
+
+        # Add mode
+        feed_dict[self._is_training] = is_training
+
+        # Get session vars
+        prediction_keys = list(self._predict_spec.output.keys())
+        prediction_values = list(self._predict_spec.output.values())
+        session_vars = prediction_values
 
         # Run on graph
-        results = self._session.run(fetches=input_tensors, feed_dict=feed_dict)
+        results = self._session.run(fetches=session_vars, feed_dict=feed_dict)
 
-        predictions = dict(zip(input_keys, results))
+        predictions = dict()
+        for key, value in zip(prediction_keys, results):
+            predictions[key] = value
 
         return predictions
 
-    def _predict_from_dataset(self, input_fn: InputFn) -> dict:
+    def evaluate(self,
+                 input_fn: InputFn,
+                 is_training: Optional[bool] = False) -> dict:
+        """
+        Evaluate
+
+        :param input_fn: Input function
+        :param is_training: Training mode
+        :return: Evaluation metrics
+        """
+
+        if self._evaluation_spec is None:
+            raise RuntimeError('Must define an EvaluationSpec before using evaluate method')
+
+        # Init
+        with self._graph.as_default():
+            dataset = input_fn()
+            iterator = dataset.make_initializable_iterator()
+
+        handle = self._session.run(iterator.string_handle())
+        metric_update_ops = [v[1] for v in self._evaluation_spec.metric_ops.values()]  # Gather update op
+        self._session.run([iterator.initializer,
+                           self._running_variables_initializer])
+        evaluation_pbar = tqdm(total=None,
+                               desc='Evaluation',
+                               ncols=self.TQDM_NCOLS)
+        session_vars = metric_update_ops
+
+        # Evaluation
+        while True:
+            try:
+                # Evaluation step
+                self._session.run(fetches=session_vars,
+                                  feed_dict={self._handle: handle,
+                                             self._is_training: is_training})
+
+                # Update progress bar
+                evaluation_pbar.update()
+
+            except tf.errors.OutOfRangeError:
+
+                # Gather metrics
+                metric_names = list(self._evaluation_spec.metric_ops.keys())
+                metric_tensors = [v[0] for v in self._evaluation_spec.metric_ops.values()]
+                metric_values = self._session.run(fetches=metric_tensors)
+                metrics = dict(zip(metric_names, metric_values))
+
+                # Close bar
+                evaluation_pbar.close()
+
+                return metrics
+
+    def save_ckpt(self):
+        """
+        Saves a checkpoint.
+
+        :return: Path prefix to the checkpoint file
+        """
+
+        return self._train_saver.save(self._session,
+                                      save_path=str(self.train_checkpoints / 'model_iter'),
+                                      global_step=self.global_step)
+
+    def _predict_from_dataset(self, input_fn: InputFn,
+                              is_training: Optional[bool] = False) -> Generator[dict, None, None]:
         """
         Predict from dataset
 
         :param input_fn: Input function
+        :param is_training: Training mode
         :return: Predictions
         """
 
         # Init
-        dataset = input_fn()
-        iterator = dataset.make_initializable_iterator()
-        handle = iterator.string_handle()
+        with self._graph.as_default():
+            dataset = input_fn()
+            iterator = dataset.make_initializable_iterator()
+
+        self._session.run(iterator.initializer)
+        handle = self._session.run(iterator.string_handle())
         prediction_keys = list(self._predict_spec.output.keys())
         prediction_values = list(self._predict_spec.output.values())
         session_vars = prediction_values
-        predictions = defaultdict(list)
 
+        # Predictions
         with suppress(tf.errors.OutOfRangeError):
             while True:
-                # Evaluation step
+                # Prediction step
+                predictions = dict()
                 batch_results = self._session.run(fetches=session_vars,
                                                   feed_dict={self._handle: handle,
-                                                             self._is_training: False})
+                                                             self._is_training: is_training})
 
                 for key, value in zip(prediction_keys, batch_results):
-                    predictions[key].append(value)
+                    predictions[key] = value
 
-        return dict(predictions)
+                yield predictions
+
+    @staticmethod
+    def _get_or_create_directory(model_dir: Union[str, None]) -> Path:
+        """
+        Gets if exists or creates a model directory. Will create a temporary one if model_dir == None
+
+        :param model_dir: Path to model directory
+        :return: Path to model directory
+        """
+
+        if isinstance(model_dir, str):
+            model_dir = Path(model_dir)
+            if not model_dir.parent.exists():
+                raise FileNotFoundError("Parent directory doesn't exist. ({})".format(model_dir.parent))
+            if not model_dir.exists():
+                model_dir.mkdir()
+        else:
+            model_dir = TemporaryDirectory()
+            model_dir = Path(model_dir.name)
+
+        return model_dir
