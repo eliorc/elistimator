@@ -122,6 +122,10 @@ class Estimator:
     def graph(self) -> tf.Graph:
         return self._graph
 
+    @property
+    def checkpoints(self) -> Dict[int, dict]:
+        return self._checkpoints
+
     def __init__(self,
                  model_fn: ModelFn,
                  model_dir: Optional[str] = None,
@@ -525,7 +529,7 @@ class Estimator:
 
                 return metrics
 
-    def save_ckpt(self):
+    def save_ckpt(self) -> str:
         """
         Saves a checkpoint.
 
@@ -545,7 +549,7 @@ class Estimator:
         if self._last_validation_metrics and self._last_validation_metrics[0] == global_step:
             metrics = self._last_validation_metrics[1]
         else:
-            metrics = None
+            metrics = {}
         self._checkpoints[global_step]['metrics'] = metrics
 
         # Remove old entries (not tracked by the train.Saver)
@@ -558,6 +562,34 @@ class Estimator:
             del self._checkpoints[key_to_remove]
 
         return ckpt_file
+
+    def restore_ckpt(self, path_prefix: str):
+        """
+        Restores graph and variables from a checkpoint prefix
+
+        :param path_prefix: Path prefix
+        """
+
+        with self._graph.as_default():
+            self._train_saver.restore(self._session, path_prefix)
+
+    def restore_best_ckpt(self):
+        """
+        Restores graph and variables from a the best (using validation loss as measure) checkpoint saved.
+        If validation loss is not available, returns the last checkpoint
+        """
+
+        # Get best or latest checkpoint
+        best_checkpoint = sorted(self._checkpoints.items(), key=lambda k_v: k_v[1]['metrics'].get('loss', -k_v[0]))[0][1]['file']
+
+        self.restore_ckpt(path_prefix=best_checkpoint)
+
+    def restore_latest_ckpt(self):
+        """
+        Restores graph and variables from the latest checkpoint saved
+        """
+
+        self.restore_ckpt(path_prefix=self._train_saver.last_checkpoints[-1])
 
     def _predict_from_dataset(self, input_fn: InputFn,
                               is_training: Optional[bool] = False) -> Generator[dict, None, None]:
