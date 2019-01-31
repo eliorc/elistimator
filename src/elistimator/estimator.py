@@ -23,18 +23,21 @@ class TrainSpec:
 
     def __init__(self,
                  loss: tf.Tensor,
-                 train_op: tf.train.Optimizer):
+                 train_op: tf.train.Optimizer,
+                 create_viz_op: bool = True):
         """
 
         :param loss: Loss tensor
         :param train_op: Training operation (notice, this is not the optimizer, but the optimization call [ex. optimizer.minimize()])
+        :param create_viz_op: Create the visualization op (should be done once)
         """
 
         self.loss = loss
         self.train_op = train_op
 
         # Visualize
-        tf.summary.scalar('loss', self.loss)
+        if create_viz_op:
+            tf.summary.scalar('loss', self.loss)
 
 
 class EvaluationSpec:
@@ -158,6 +161,8 @@ class Estimator:
         self._train_saver = None
         self._session = None
         self._graph = None
+        self._last_validation_metrics = None
+        self._checkpoints = dict()
 
     def setup(self,
               train_input_fn: InputFn,
@@ -394,12 +399,12 @@ class Estimator:
                 # Add loss
                 metrics['loss'] = validation_loss
 
-                # Write metrics
-                validation_pbar.write(
-                    ' '.join(['='.join([str(metric), str(metric_value)]) for metric, metric_value in metrics.items()]))
-
                 # Close bar
                 validation_pbar.close()
+
+                # Write metrics
+                tqdm.write(
+                    ' '.join(['='.join([str(metric), str(metric_value)]) for metric, metric_value in metrics.items()]))
 
                 self._validation_size = local_step
 
@@ -408,6 +413,13 @@ class Estimator:
                     summary = tf.Summary()
                     summary.value.add(tag=tag, simple_value=value)
                     self._validation_summary_writer.add_summary(summary, global_step=global_step_)
+
+                # Save last validation metrics
+                self._last_validation_metrics = (global_step_, metrics)
+
+                # Associate with save
+                if global_step_ in self._checkpoints:
+                    self._checkpoints[global_step_]['metrics'] = metrics
 
                 return metrics
 
@@ -520,9 +532,32 @@ class Estimator:
         :return: Path prefix to the checkpoint file
         """
 
-        return self._train_saver.save(self._session,
-                                      save_path=str(self.train_checkpoints / 'model_iter'),
-                                      global_step=self.global_step)
+        # Get global step
+        global_step = self.global_step
+
+        # Save checkpoint
+        ckpt_file = self._train_saver.save(self._session,
+                                           save_path=str(self.train_checkpoints / 'model_iter'),
+                                           global_step=global_step)
+        self._checkpoints[global_step] = {'file': ckpt_file}
+
+        # Associate with metrics
+        if self._last_validation_metrics and self._last_validation_metrics[0] == global_step:
+            metrics = self._last_validation_metrics[1]
+        else:
+            metrics = None
+        self._checkpoints[global_step]['metrics'] = metrics
+
+        # Remove old entries (not tracked by the train.Saver)
+        keys_to_remove = []
+        for ckpt_key, ckpt_values in self._checkpoints.items():
+            if ckpt_values['file'] not in self._train_saver.last_checkpoints:
+                keys_to_remove.append(ckpt_key)
+
+        for key_to_remove in keys_to_remove:
+            del self._checkpoints[key_to_remove]
+
+        return ckpt_file
 
     def _predict_from_dataset(self, input_fn: InputFn,
                               is_training: Optional[bool] = False) -> Generator[dict, None, None]:
