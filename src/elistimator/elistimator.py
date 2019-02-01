@@ -357,6 +357,8 @@ class Elistimator:
         if self._train_spec is None or self._train_handle is None:
             raise RuntimeError('Must call setup with train_input_fn before using the train method')
 
+        self._train_count += 1
+
         # Preparation
         if not max_steps:
             max_steps = float('inf')
@@ -371,7 +373,6 @@ class Elistimator:
                           ncols=self.TQDM_NCOLS)
 
         # Training
-        self._train_count += 1
         while local_step < max_steps:
             try:
 
@@ -822,10 +823,6 @@ class Elistimator:
             if meta['_evaluation_spec'] else None
         predict_spec = PredictSpec.from_dict(graph=estimator.graph, dictionary=meta['_predict_spec']) \
             if meta['_predict_spec'] else None
-
-        estimator._train_spec = train_spec
-        estimator._evaluation_spec = evaluation_spec
-        estimator._predict_spec = predict_spec
 
         # Restore model_fn
         model_fn = lambda *args: (train_spec, evaluation_spec, predict_spec)
