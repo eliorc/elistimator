@@ -354,8 +354,6 @@ class Elistimator:
         :return: self, for chaining
         """
 
-        self._train_count += 1
-
         if self._train_spec is None or self._train_handle is None:
             raise RuntimeError('Must call setup with train_input_fn before using the train method')
 
@@ -373,6 +371,7 @@ class Elistimator:
                           ncols=self.TQDM_NCOLS)
 
         # Training
+        self._train_count += 1
         while local_step < max_steps:
             try:
 
@@ -384,7 +383,7 @@ class Elistimator:
                 self._train_summary_writer.add_summary(visualization, global_step=global_step_)
 
                 # Update progress bar
-                train_pbar.set_postfix(loss=loss)
+                train_pbar.set_postfix(loss=format(round(loss, 6), '.6f'))
                 train_pbar.update()
 
                 local_step += 1
@@ -416,7 +415,7 @@ class Elistimator:
         """
 
         if self._evaluation_spec is None or self._validation_handle is None:
-            raise RuntimeError('Must call setup with validation_input_fn before using the train method')
+            raise RuntimeError('Must call setup with validation_input_fn before using the validate method')
 
         # Init
         global_step = tf.train.get_global_step(graph=self._graph)
