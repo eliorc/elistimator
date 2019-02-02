@@ -36,7 +36,7 @@ class TrainSpec(ElistimatorSpec):
 
     def __init__(self,
                  loss: tf.Tensor,
-                 train_op: tf.train.Optimizer,
+                 train_op: tf.Operation,
                  create_viz_op: bool = True):
         """
 
@@ -226,19 +226,20 @@ class Elistimator:
         self._session = tf.Session(graph=self._graph, **session_args)
         self._last_validation_metrics = None
         self._checkpoints = dict()
+        self._global_vars_initialized = False
 
     def setup(self,
               train_input_fn: InputFn,
               validation_input_fn: Optional[InputFn] = None,
               data_keys: Optional[List[str]] = None,
-              train_saver_options: Optional[dict] = None) -> 'Elistimator':
+              train_saver_args: Optional[dict] = None) -> 'Elistimator':
         """
         Setup training flow, should be called only once.
 
         :param train_input_fn: Training input function
         :param validation_input_fn: Validation input function
         :param data_keys: Keys to match output of the training/validation inputs
-        :param train_saver_options: Options to be passed to tf.train.Saver constructor
+        :param train_saver_args: Options to be passed to tf.train.Saver constructor
         :return: self, for chaining
         """
 
@@ -284,7 +285,7 @@ class Elistimator:
                     if isinstance(iterator_output, dict):
                         data = iterator_output
                     else:
-                        data = {data_key: tf.identity(data_tensor, name=data_key)
+                        data = {data_key: data_tensor
                                 for data_key, data_tensor in zip(data_keys, iterator_output)}
 
             train_spec, validation_spec, predict_spec = self._model_fn(data, self._is_training, self._params)
@@ -299,7 +300,7 @@ class Elistimator:
                 self._visualization_op = tf.summary.merge_all()
 
             # Create a train saver
-            self._train_saver = tf.train.Saver() if not train_saver_options else tf.train.Saver(**train_saver_options)
+            self._train_saver = tf.train.Saver() if not train_saver_args else tf.train.Saver(**train_saver_args)
 
         # Create summary logs directories
         if validation_input_fn and not self.train_logs.exists():
@@ -334,16 +335,14 @@ class Elistimator:
             self._validation_summary_writer = tf.summary.FileWriter(logdir=str(self.validation_logs),
                                                                     graph=self._graph)
         # First time initialization
+        if not self._global_vars_initialized:
+            with self._graph.as_default():
+                self._session.run(tf.global_variables_initializer())
+                self._global_vars_initialized = True
+
         self._session.run(self._train_iterator.initializer)
 
         return self
-
-    def initialize_global_variables(self):
-        """
-        Calls the tf.global_variables_initializer()
-        """
-        with self._graph.as_default():
-            self._session.run(tf.global_variables_initializer())
 
     def train(self,
               max_steps: Optional[int] = None) -> 'Elistimator':
@@ -505,6 +504,9 @@ class Elistimator:
         :return:
         """
 
+        if self._predict_spec is None:
+            raise RuntimeError('Must define an PredictSpec before using the predict method')
+
         if sum([bool(args), bool(input_fn), bool(kwargs)]) != 1:
             raise ValueError('Must supply ONE AND ONLY ONE of positional args / key-word args / input function')
 
@@ -553,7 +555,7 @@ class Elistimator:
         """
 
         if self._evaluation_spec is None:
-            raise RuntimeError('Must define an EvaluationSpec before using evaluate method')
+            raise RuntimeError('Must define an EvaluationSpec before using the evaluate method')
 
         # Init
         with self._graph.as_default():
@@ -751,7 +753,8 @@ class Elistimator:
             '_visualization_op': self._visualization_op.name,
             '_input_signature': self._input_signature,
             '_checkpoints': self._checkpoints,
-            '_train_count': self._train_count}
+            '_train_count': self._train_count,
+            '_global_vars_initialized': self._global_vars_initialized}
 
         with open(str(self.train_checkpoints / self.ELISTIMATOR_META_FILENAME), 'wb') as e_meta:
             pickle.dump(obj=attrs_to_save, file=e_meta)
@@ -824,6 +827,11 @@ class Elistimator:
         predict_spec = PredictSpec.from_dict(graph=estimator.graph, dictionary=meta['_predict_spec']) \
             if meta['_predict_spec'] else None
 
+        # Restore specs
+        estimator._predict_spec = predict_spec
+        estimator._evaluation_spec = evaluation_spec
+        estimator._train_spec = train_spec
+
         # Restore model_fn
         model_fn = lambda *args: (train_spec, evaluation_spec, predict_spec)
         estimator._model_fn = model_fn
@@ -839,5 +847,8 @@ class Elistimator:
 
         # Restore train count
         estimator._train_count = meta['_train_count']
+
+        # Restore global var status
+        estimator._global_vars_initialized = meta['_global_vars_initialized']
 
         return estimator
